@@ -77,8 +77,9 @@ resource "kubernetes_job_v1" "bootstrap" {
   }
 
   spec {
-    backoff_limit              = 3
-    ttl_seconds_after_finished = 600
+    # Sem ttl_seconds_after_finished: se o Kubernetes apagasse o Job concluído,
+    # o Terraform o recriaria a cada plan.
+    backoff_limit = 3
 
     template {
       metadata {}

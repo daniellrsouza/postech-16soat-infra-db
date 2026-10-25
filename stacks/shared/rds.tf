@@ -66,9 +66,12 @@ resource "aws_db_parameter_group" "this" {
   family      = "postgres16"
   description = "TLS obrigatorio e log de consultas lentas"
 
+  # Parâmetro estático: a AWS registra pending-reboot (sem isso, todo plan
+  # mostraria diferença). Na criação da instância ele já vale.
   parameter {
-    name  = "rds.force_ssl"
-    value = "1"
+    name         = "rds.force_ssl"
+    value        = "1"
+    apply_method = "pending-reboot"
   }
 
   parameter {
