@@ -1,0 +1,196 @@
+name: Terraform (infra DB)
+
+# Fluxo (D21 / P9):
+#   PR para develop ou main  → validate + plan (shared e env do ambiente de destino)
+#   push na develop          → apply env=homolog
+#   push na main             → apply shared + env=prod
+#   workflow_dispatch        → plan/apply/destroy manual de um alvo
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Ação do Terraform"
+        required: true
+        type: choice
+        default: plan
+        options: [plan, apply, destroy]
+      target:
+        description: "Stack alvo (destroy: derrube homolog e prod antes do shared)"
+        required: true
+        type: choice
+        default: homolog
+        options: [shared, homolog, prod]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-infra-db
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.15.8"
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate
+        run: |
+          for stack in stacks/shared stacks/env; do
+            echo "::group::$stack"
+            terraform -chdir="$stack" init -backend=false -input=false
+            terraform -chdir="$stack" validate
+            echo "::endgroup::"
+          done
+
+  plan:
+    name: Plan
+    if: github.event_name == 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    env:
+      TARGET_ENV: ${{ github.base_ref == 'main' && 'prod' || 'homolog' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Plan shared
+        run: scripts/tf.sh shared plan -no-color
+
+      - name: Plan env (${{ env.TARGET_ENV }})
+        run: |
+          # O stack env lê as saídas do shared no SSM; antes do primeiro apply
+          # do shared não há o que planejar.
+          if aws ssm get-parameter --name /tech-challenge/shared/db-host >/dev/null 2>&1; then
+            scripts/tf.sh env "$TARGET_ENV" plan -no-color
+          else
+            echo "::notice::Stack shared (RDS) ainda não aplicado; plan do env ignorado."
+          fi
+
+  deploy-homolog:
+    name: Deploy homolog
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: homolog
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verificar stack shared
+        run: |
+          aws ssm get-parameter --name /tech-challenge/shared/db-host >/dev/null 2>&1 || {
+            echo "::error::Stack shared (RDS) não aplicado. Rode o pipeline da main (ou dispatch apply/shared) antes."
+            exit 1
+          }
+
+      - name: Apply env homolog
+        run: scripts/tf.sh env homolog apply -auto-approve -no-color
+
+      - name: Outputs
+        run: scripts/tf.sh env homolog output
+
+  deploy-prod:
+    name: Deploy prod
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Apply shared
+        run: scripts/tf.sh shared apply -auto-approve -no-color
+
+      - name: Apply env prod
+        run: scripts/tf.sh env prod apply -auto-approve -no-color
+
+      - name: Outputs
+        run: |
+          scripts/tf.sh shared output
+          scripts/tf.sh env prod output
+
+  manual:
+    name: Manual (${{ inputs.action }} ${{ inputs.target }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ubuntu-latest
+    # homolog só aceita a develop e prod só a main (E0.3a); shared usa prod.
+    environment: ${{ inputs.target == 'homolog' && 'homolog' || 'prod' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform ${{ inputs.action }}
+        env:
+          ACTION: ${{ inputs.action }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          if [ "$TARGET" = "shared" ]; then STACK=(shared); else STACK=(env "$TARGET"); fi
+          case "$ACTION" in
+            plan)    scripts/tf.sh "${STACK[@]}" plan -no-color ;;
+            apply)   scripts/tf.sh "${STACK[@]}" apply -auto-approve -no-color ;;
+            destroy) scripts/tf.sh "${STACK[@]}" destroy -auto-approve -no-color ;;
+          esac
