@@ -1,6 +1,6 @@
 # postech-16soat-infra-db
 
-Infraestrutura do banco de dados gerenciado do Tech Challenge (FIAP/SOAT, Grupo 15, Fase 3):
+Infraestrutura do banco de dados gerenciado do Tech Challenge (FIAP/SOAT, Fase 3):
 **Amazon RDS for PostgreSQL 16**, em subnets privadas, com um database e usuários próprios
 para cada ambiente (`homolog` e `prod`), provisionado com Terraform.
 
